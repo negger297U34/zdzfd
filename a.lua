@@ -725,33 +725,64 @@ end
 
 local TouchSlop = 10
 local function OnTap(Button: GuiButton, Callback: (...any) -> ...any)
-    local Moved, EndedAt = false, 0
+    local Touch = nil
 
     Button.InputBegan:Connect(function(Input: InputObject)
-        if Input.UserInputType ~= Enum.UserInputType.Touch then
+        if Input.UserInputType ~= Enum.UserInputType.Touch or Input.UserInputState ~= Enum.UserInputState.Begin then
             return
         end
 
-        Moved = false
-        local Start = Input.Position
+        local State = {
+            Input = Input,
+            Start = Input.Position,
+            Moved = false,
+            Ended = false,
+            EndedAt = 0,
+            Canvas = {},
+        }
+
+        local Parent = Button.Parent
+        while Parent do
+            if Parent:IsA("ScrollingFrame") then
+                State.Canvas[Parent] = Parent.CanvasPosition
+            end
+            Parent = Parent.Parent
+        end
+
+        Touch = State
+
         local Changed
         Changed = Input.Changed:Connect(function()
-            if (Input.Position - Start).Magnitude > TouchSlop then
-                Moved = true
+            if (Input.Position - State.Start).Magnitude > TouchSlop then
+                State.Moved = true
             end
 
-            local State = Input.UserInputState
-            if State == Enum.UserInputState.End or State == Enum.UserInputState.Cancel then
-                EndedAt = os.clock()
+            local InputState = Input.UserInputState
+            if InputState == Enum.UserInputState.End or InputState == Enum.UserInputState.Cancel then
+                State.Ended = true
+                State.EndedAt = os.clock()
                 Changed:Disconnect()
             end
         end)
     end)
 
     return Button.MouseButton1Click:Connect(function(...)
-        if Moved then
-            Moved = false
-            if os.clock() - EndedAt < 0.35 then
+        local State = Touch
+        Touch = nil
+
+        if State and (not State.Ended or os.clock() - State.EndedAt < 0.35) then
+            local Scrolled = State.Moved or (State.Input.Position - State.Start).Magnitude > TouchSlop
+
+            if not Scrolled then
+                for Frame, Position in State.Canvas do
+                    if (Frame.CanvasPosition - Position).Magnitude > 2 then
+                        Scrolled = true
+                        break
+                    end
+                end
+            end
+
+            if Scrolled then
                 return
             end
         end
