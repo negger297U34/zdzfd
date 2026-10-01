@@ -723,6 +723,63 @@ local function IsMovementInput(Input: InputObject)
         and Library.IsRobloxFocused
 end
 
+local TouchSlop = 10
+local function OnTap(Button: GuiButton, Callback: (...any) -> ...any)
+    local Moved, EndedAt = false, 0
+
+    Button.InputBegan:Connect(function(Input: InputObject)
+        if Input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        Moved = false
+        local Start = Input.Position
+        local Changed
+        Changed = Input.Changed:Connect(function()
+            if (Input.Position - Start).Magnitude > TouchSlop then
+                Moved = true
+            end
+
+            local State = Input.UserInputState
+            if State == Enum.UserInputState.End or State == Enum.UserInputState.Cancel then
+                EndedAt = os.clock()
+                Changed:Disconnect()
+            end
+        end)
+    end)
+
+    return Button.MouseButton1Click:Connect(function(...)
+        if Moved then
+            Moved = false
+            if os.clock() - EndedAt < 0.35 then
+                return
+            end
+        end
+
+        Callback(...)
+    end)
+end
+
+local function IsDragMove(Input: InputObject, DragInput: InputObject?)
+    if not IsHoverInput(Input) then
+        return false
+    end
+
+    return Input.UserInputType ~= Enum.UserInputType.Touch or DragInput == nil or Input == DragInput
+end
+
+local function IsInputEnded(Input: InputObject)
+    return Input.UserInputState == Enum.UserInputState.End or Input.UserInputState == Enum.UserInputState.Cancel
+end
+
+local function GetInputLocation(Input: InputObject): Vector2
+    if Input.UserInputType == Enum.UserInputType.Touch then
+        return Vector2.new(Input.Position.X, Input.Position.Y)
+    end
+
+    return Vector2.new(Mouse.X, Mouse.Y)
+end
+
 local function GetTableSize(Table: { [any]: any })
     local Size = 0
 
@@ -2149,6 +2206,39 @@ local function GetSnapGuideOffset(Name: string, SnappedValue: number, ElemDimens
     return SnappedValue -- LeftEdge / TopEdge
 end
 
+local ScreenBound = {}
+local ScreenKeep = 48
+
+local function ClampToScreen(UI: GuiObject, AbsPos: Vector2): Vector2
+    local Origin = ScreenGui.AbsolutePosition
+    local Bounds = ScreenGui.AbsoluteSize
+    local Size = UI.AbsoluteSize
+    local KeepX = math.min(ScreenKeep, Size.X)
+    local KeepY = math.min(ScreenKeep, Size.Y)
+    local MinX = Origin.X + KeepX - Size.X
+
+    return Vector2.new(
+        math.clamp(AbsPos.X, MinX, math.max(MinX, Origin.X + Bounds.X - KeepX)),
+        math.clamp(AbsPos.Y, Origin.Y, math.max(Origin.Y, Origin.Y + Bounds.Y - KeepY))
+    )
+end
+
+Library:GiveSignal(ScreenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    task.defer(function()
+        for UI in ScreenBound do
+            if not UI.Parent then
+                continue
+            end
+
+            local AbsPos = UI.AbsolutePosition
+            local Clamped = ClampToScreen(UI, AbsPos)
+            if Clamped ~= AbsPos then
+                UI.Position += UDim2.fromOffset(Clamped.X - AbsPos.X, Clamped.Y - AbsPos.Y)
+            end
+        end
+    end)
+end))
+
 function Library:MakeDraggable(
     UI: GuiObject,
     DragFrame: GuiObject,
@@ -2157,6 +2247,8 @@ function Library:MakeDraggable(
     SnapConfig: { Enabled: boolean, Distance: number?, Margin: number?, AvoidCoreGui: boolean? }?
 )
     local StartPos
+    local StartAbs
+    local DragInput
     local FramePos
     local Dragging = false
     local Changed
@@ -2209,12 +2301,18 @@ function Library:MakeDraggable(
             return
         end
 
+        if Changed and Changed.Connected then
+            Changed:Disconnect()
+        end
+
         StartPos = Input.Position
+        StartAbs = UI.AbsolutePosition
+        DragInput = Input
         FramePos = UI.Position
         Dragging = true
 
         Changed = Input.Changed:Connect(function()
-            if Input.UserInputState ~= Enum.UserInputState.End then
+            if not IsInputEnded(Input) then
                 return
             end
 
@@ -2246,7 +2344,7 @@ function Library:MakeDraggable(
         end
 
         -- le bouton resize est dans la top bar : on ne bouge pas la fenêtre pendant un resize
-        if Dragging and IsHoverInput(Input) and not (IsMainWindow and Library.IsResizingWindow) then
+        if Dragging and IsDragMove(Input, DragInput) and not (IsMainWindow and Library.IsResizingWindow) then
             local Delta = Input.Position - StartPos
             local NewX = FramePos.X.Offset + Delta.X
             local NewY = FramePos.Y.Offset + Delta.Y
@@ -2283,6 +2381,11 @@ function Library:MakeDraggable(
                 end
             end
 
+            local Target = StartAbs + Vector2.new(NewX - FramePos.X.Offset, NewY - FramePos.Y.Offset)
+            local Clamped = ClampToScreen(UI, Target)
+            NewX += Clamped.X - Target.X
+            NewY += Clamped.Y - Target.Y
+
             UI.Position = UDim2.new(FramePos.X.Scale, NewX, FramePos.Y.Scale, NewY)
         end
     end)
@@ -2290,7 +2393,11 @@ function Library:MakeDraggable(
     Library:GiveSignal(InputChanged)
     Library:GiveSignal(InputBegan)
 
+    ScreenBound[UI] = true
+
     UI.Destroying:Once(function()
+        ScreenBound[UI] = nil
+
         if InputChanged and InputChanged.Connected then
             InputChanged:Disconnect()
         end
@@ -2324,24 +2431,54 @@ end
 
 function Library:MakeResizable(UI: GuiObject, DragFrame: GuiObject, Callback: () -> ()?)
     local StartPos
+    local DragInput
     local FrameSize
     local Dragging = false
     local Changed
     local InputBegan
     local InputChanged
+    local BoundsChanged
+
+    local function GetScale()
+        local Offset = UI.Size.X.Offset
+        return Offset > 0 and UI.AbsoluteSize.X > 0 and UI.AbsoluteSize.X / Offset or 1
+    end
+
+    local function GetMaxSize(Scale: number)
+        local Bounds = ScreenGui.AbsoluteSize
+        return math.max(Library.MinSize.X, (Bounds.X - 16) / Scale), math.max(Library.MinSize.Y, (Bounds.Y - 16) / Scale)
+    end
+
+    BoundsChanged = ScreenGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        local MaxX, MaxY = GetMaxSize(GetScale())
+        local Size = UI.Size
+        if Size.X.Offset <= MaxX and Size.Y.Offset <= MaxY then
+            return
+        end
+
+        UI.Size = UDim2.new(Size.X.Scale, math.min(Size.X.Offset, MaxX), Size.Y.Scale, math.min(Size.Y.Offset, MaxY))
+        if Callback then
+            Library:SafeCallback(Callback)
+        end
+    end)
 
     InputBegan = DragFrame.InputBegan:Connect(function(Input: InputObject)
         if not IsClickInput(Input) then
             return
         end
 
+        if Changed and Changed.Connected then
+            Changed:Disconnect()
+        end
+
         StartPos = Input.Position
+        DragInput = Input
         FrameSize = UI.Size
         Dragging = true
         Library.IsResizingWindow = true
 
         Changed = Input.Changed:Connect(function()
-            if Input.UserInputState ~= Enum.UserInputState.End then
+            if not IsInputEnded(Input) then
                 return
             end
 
@@ -2368,13 +2505,15 @@ function Library:MakeResizable(UI: GuiObject, DragFrame: GuiObject, Callback: ()
             return
         end
 
-        if Dragging and IsHoverInput(Input) then
-            local Delta = Input.Position - StartPos
+        if Dragging and IsDragMove(Input, DragInput) then
+            local Scale = GetScale()
+            local MaxX, MaxY = GetMaxSize(Scale)
+            local Delta = (Input.Position - StartPos) / Scale
             UI.Size = UDim2.new(
                 FrameSize.X.Scale,
-                math.clamp(FrameSize.X.Offset + Delta.X, Library.MinSize.X, math.huge),
+                math.clamp(FrameSize.X.Offset + Delta.X, Library.MinSize.X, MaxX),
                 FrameSize.Y.Scale,
-                math.clamp(FrameSize.Y.Offset + Delta.Y, Library.MinSize.Y, math.huge)
+                math.clamp(FrameSize.Y.Offset + Delta.Y, Library.MinSize.Y, MaxY)
             )
             if Callback then
                 Library:SafeCallback(Callback)
@@ -2384,8 +2523,13 @@ function Library:MakeResizable(UI: GuiObject, DragFrame: GuiObject, Callback: ()
 
     Library:GiveSignal(InputChanged)
     Library:GiveSignal(InputBegan)
+    Library:GiveSignal(BoundsChanged)
 
     UI.Destroying:Once(function()
+        if BoundsChanged and BoundsChanged.Connected then
+            BoundsChanged:Disconnect()
+        end
+
         if InputChanged and InputChanged.Connected then
             InputChanged:Disconnect()
         end
@@ -2695,7 +2839,7 @@ function Library:MakeBoxPopOut(Box: any, Options: {
                 Parent = Frame,
             })
             Library:ApplyLucideIcon(PlaceholderDockIcon, PopOutIcon)
-            PlaceholderDockIcon.MouseButton1Click:Connect(function()
+            OnTap(PlaceholderDockIcon, function()
                 Box:SetPoppedOut(false)
             end)
         end
@@ -3377,14 +3521,14 @@ function Library:AddDraggableMenu(Name: string)
         Parent = Holder,
     })
     New("UIListLayout", {
-        Padding = UDim.new(0, 7),
+        Padding = UDim.new(0, Library.IsMobile and 2 or 7),
         Parent = Container,
     })
     New("UIPadding", {
         PaddingBottom = UDim.new(0, 7),
-        PaddingLeft = UDim.new(0, 7),
-        PaddingRight = UDim.new(0, 7),
-        PaddingTop = UDim.new(0, 7),
+        PaddingLeft = UDim.new(0, Library.IsMobile and 10 or 7),
+        PaddingRight = UDim.new(0, Library.IsMobile and 10 or 7),
+        PaddingTop = UDim.new(0, Library.IsMobile and 4 or 7),
         Parent = Container,
     })
 
@@ -3662,6 +3806,21 @@ function Library:AddContextMenu(
         })
     end
 
+    local function UpdatePosition()
+        local MenuOffset = typeof(Offset) == "function" and Offset() or Offset
+        local X = math.floor(Holder.AbsolutePosition.X + MenuOffset[1])
+        local Y = math.floor(Holder.AbsolutePosition.Y + MenuOffset[2])
+
+        local Bounds = ParentGui.AbsoluteSize
+        local MenuSize = Menu.AbsoluteSize
+        local Margin = 4
+
+        Menu.Position = UDim2.fromOffset(
+            math.clamp(X, math.min(X, Margin), math.max(math.min(X, Margin), Bounds.X - MenuSize.X - Margin)),
+            math.clamp(Y, math.min(Y, Margin), math.max(math.min(Y, Margin), Bounds.Y - MenuSize.Y - Margin))
+        )
+    end
+
     function Table:Open()
         if CurrentMenu == Table then
             return
@@ -3677,17 +3836,8 @@ function Library:AddContextMenu(
         Menu.Parent = nil
         Menu.Parent = TargetParent
 
-        if typeof(Offset) == "function" then
-            Menu.Position = UDim2.fromOffset(
-                math.floor(Holder.AbsolutePosition.X + Offset()[1]),
-                math.floor(Holder.AbsolutePosition.Y + Offset()[2])
-            )
-        else
-            Menu.Position = UDim2.fromOffset(
-                math.floor(Holder.AbsolutePosition.X + Offset[1]),
-                math.floor(Holder.AbsolutePosition.Y + Offset[2])
-            )
-        end
+        UpdatePosition()
+        Table.SizeSignal = Menu:GetPropertyChangedSignal("AbsoluteSize"):Connect(UpdatePosition)
 
         local TargetSize = typeof(Table.Size) == "function" and Table.Size() or Table.Size
 
@@ -3738,17 +3888,7 @@ function Library:AddContextMenu(
         end
 
         Table.Signal = Holder:GetPropertyChangedSignal("AbsolutePosition"):Connect(function()
-            if typeof(Offset) == "function" then
-                Menu.Position = UDim2.fromOffset(
-                    math.floor(Holder.AbsolutePosition.X + Offset()[1]),
-                    math.floor(Holder.AbsolutePosition.Y + Offset()[2])
-                )
-            else
-                Menu.Position = UDim2.fromOffset(
-                    math.floor(Holder.AbsolutePosition.X + Offset[1]),
-                    math.floor(Holder.AbsolutePosition.Y + Offset[2])
-                )
-            end
+            UpdatePosition()
 
             local HolderAllowed = Library:IsInsideFrame(Library.WindowContainer, Holder)
             if not HolderAllowed then
@@ -3776,6 +3916,11 @@ function Library:AddContextMenu(
         if Table.Signal then
             Table.Signal:Disconnect()
             Table.Signal = nil
+        end
+
+        if Table.SizeSignal then
+            Table.SizeSignal:Disconnect()
+            Table.SizeSignal = nil
         end
 
         Table.Active = false
@@ -4418,9 +4563,13 @@ do
 
         local KeybindsToggle = { Normal = KeyPicker.Mode ~= "Toggle" }
         do
+            local RowHeight = Library.IsMobile and 32 or 16
+            local CheckSize = Library.IsMobile and 20 or 14
+            local LabelOffset = CheckSize + 8
+
             local Holder = New("TextButton", {
                 BackgroundTransparency = 1,
-                Size = UDim2.new(1, 0, 0, 16),
+                Size = UDim2.new(1, 0, 0, RowHeight),
                 Text = "",
                 Visible = not Info.NoUI,
                 Parent = Library.KeybindContainer,
@@ -4431,7 +4580,7 @@ do
                 BackgroundTransparency = 1,
                 Size = UDim2.fromScale(0, 1),
                 Text = "",
-                TextSize = 14,
+                TextSize = Library.IsMobile and 15 or 14,
                 TextTransparency = 0.5,
                 Parent = Holder,
             })
@@ -4440,7 +4589,7 @@ do
                 AnchorPoint = Vector2.new(0, 0.5),
                 BackgroundColor3 = "MainColor",
                 Position = UDim2.fromScale(0, 0.5),
-                Size = UDim2.fromOffset(14, 14),
+                Size = UDim2.fromOffset(CheckSize, CheckSize),
                 SizeConstraint = Enum.SizeConstraint.RelativeYY,
                 Parent = Holder,
             })
@@ -4484,12 +4633,12 @@ do
                 KeybindsToggle.Normal = Normal
 
                 Holder.Active = not Normal
-                Label.Position = Normal and UDim2.fromOffset(0, 0) or UDim2.fromOffset(22, 0)
+                Label.Position = Normal and UDim2.fromOffset(0, 0) or UDim2.fromOffset(LabelOffset, 0)
                 Checkbox.Visible = not Normal
             end
 
             KeyPicker.DoClick = function(...) end --// make luau lsp shut up
-            table.insert(KeyPicker.Connections, Holder.MouseButton1Click:Connect(function()
+            table.insert(KeyPicker.Connections, OnTap(Holder, function()
                 if KeybindsToggle.Normal then
                     return
                 end
@@ -4628,7 +4777,7 @@ do
                 Button.TextTransparency = 0.5
             end
 
-            table.insert(KeyPicker.Connections, Button.MouseButton1Click:Connect(function()
+            table.insert(KeyPicker.Connections, OnTap(Button, function()
                 ModeButton:Select()
             end))
 
@@ -4968,7 +5117,7 @@ do
             KeyPicker:Update()
         end
 
-        table.insert(KeyPicker.Connections, Picker.MouseButton1Click:Connect(function()
+        table.insert(KeyPicker.Connections, OnTap(Picker, function()
             if Picking or Library.IsPicking or ParentObj.Disabled then
                 return
             end
@@ -5649,12 +5798,12 @@ do
 
             table.insert(ColorPicker.Connections, ResizeGrabber.InputBegan:Connect(function(Input: InputObject)
                 Library.CantDragForced = true
-                local StartMouse = Vector2.new(Mouse.X, Mouse.Y)
+                local StartMouse = GetInputLocation(Input)
                 local StartWidth = ColorPicker.MapWidth
                 local StartHeight = ColorPicker.MapHeight
 
                 while IsDragInput(Input) and not ColorPicker.Destroyed do
-                    local Delta = Vector2.new(Mouse.X, Mouse.Y) - StartMouse
+                    local Delta = GetInputLocation(Input) - StartMouse
                     UpdateColorMenuSize(StartWidth + Delta.X, StartHeight + Delta.Y)
 
                     RunService.RenderStepped:Wait()
@@ -5754,7 +5903,7 @@ do
                     Parent = ContextMenu.Menu,
                 })
 
-                table.insert(ColorPicker.Connections, Button.MouseButton1Click:Connect(function()
+                table.insert(ColorPicker.Connections, OnTap(Button, function()
                     Library:SafeCallback(Func)
                     ContextMenu:Close()
                 end))
@@ -5880,7 +6029,7 @@ do
             }):Play()
         end))
 
-        table.insert(ColorPicker.Connections, CopyColorButton.MouseButton1Click:Connect(function()
+        table.insert(ColorPicker.Connections, OnTap(CopyColorButton, function()
             Library.CopiedColor = { ColorPicker.Value, ColorPicker.Transparency }
 
             CopyColorResetId += 1
@@ -5896,7 +6045,7 @@ do
             end)
         end))
 
-        table.insert(ColorPicker.Connections, PasteColorButton.MouseButton1Click:Connect(function()
+        table.insert(ColorPicker.Connections, OnTap(PasteColorButton, function()
             PasteColorResetId += 1
             local ThisResetId = PasteColorResetId
 
@@ -6014,7 +6163,7 @@ do
             ColorPicker:Update()
         end
 
-        table.insert(ColorPicker.Connections, Holder.MouseButton1Click:Connect(function()
+        table.insert(ColorPicker.Connections, OnTap(Holder, function()
             if ParentObj.Disabled then
                 return
             end
@@ -6034,11 +6183,11 @@ do
             while IsDragInput(Input) and not ColorPicker.Destroyed do
                 local MinX = SatVipMap.AbsolutePosition.X
                 local MaxX = MinX + SatVipMap.AbsoluteSize.X
-                local LocationX = math.clamp(Mouse.X, MinX, MaxX)
+                local LocationX = math.clamp(GetInputLocation(Input).X, MinX, MaxX)
 
                 local MinY = SatVipMap.AbsolutePosition.Y
                 local MaxY = MinY + SatVipMap.AbsoluteSize.Y
-                local LocationY = math.clamp(Mouse.Y, MinY, MaxY)
+                local LocationY = math.clamp(GetInputLocation(Input).Y, MinY, MaxY)
 
                 local OldSat = ColorPicker.Sat
                 local OldVib = ColorPicker.Vib
@@ -6057,7 +6206,7 @@ do
             while IsDragInput(Input) and not ColorPicker.Destroyed do
                 local Min = HueSelector.AbsolutePosition.Y
                 local Max = Min + HueSelector.AbsoluteSize.Y
-                local Location = math.clamp(Mouse.Y, Min, Max)
+                local Location = math.clamp(GetInputLocation(Input).Y, Min, Max)
 
                 local OldHue = ColorPicker.Hue
                 ColorPicker.Hue = (Location - Min) / (Max - Min)
@@ -6075,7 +6224,7 @@ do
                 while IsDragInput(Input) and not ColorPicker.Destroyed do
                     local Min = TransparencySelector.AbsolutePosition.Y
                     local Max = TransparencySelector.AbsolutePosition.Y + TransparencySelector.AbsoluteSize.Y
-                    local Location = math.clamp(Mouse.Y, Min, Max)
+                    local Location = math.clamp(GetInputLocation(Input).Y, Min, Max)
 
                     local OldTransparency = ColorPicker.Transparency
                     ColorPicker.Transparency = (Location - Min) / (Max - Min)
@@ -6709,7 +6858,7 @@ do
                 end
             end))
 
-            table.insert(Button.Connections, Button.Base.MouseButton1Click:Connect(function()
+            table.insert(Button.Connections, OnTap(Button.Base, function()
                 if Button.Disabled or Button.Locked then
                     return
                 end
@@ -7183,7 +7332,7 @@ do
             Label.Text = Text
         end
 
-        table.insert(Toggle.Connections, Button.MouseButton1Click:Connect(function()
+        table.insert(Toggle.Connections, OnTap(Button, function()
             if Toggle.Disabled then
                 return
             end
@@ -7457,7 +7606,7 @@ do
             Label.Text = Text
         end
 
-        table.insert(Toggle.Connections, Button.MouseButton1Click:Connect(function()
+        table.insert(Toggle.Connections, OnTap(Button, function()
             if Toggle.Disabled then
                 return
             end
@@ -8153,6 +8302,49 @@ do
                 return
             end
 
+            local IsTouch = Input.UserInputType == Enum.UserInputType.Touch
+            local function ApplyInput()
+                local Location = IsTouch and Input.Position.X or Mouse.X
+                local Scale = math.clamp((Location - Bar.AbsolutePosition.X) / Bar.AbsoluteSize.X, 0, 1)
+
+                local OldValue = Slider.Value
+                Slider.Value = Round(Slider.Min + ((Slider.Max - Slider.Min) * Scale), Slider.Rounding)
+
+                Slider:Display()
+                if Slider.Value ~= OldValue then
+                    Slider:RunChanged()
+                end
+            end
+
+            if IsTouch then
+                local Start = Input.Position
+                local Sliding = false
+
+                while IsDragInput(Input) and not Slider.Destroyed do
+                    local Delta = Input.Position - Start
+                    local X, Y = math.abs(Delta.X), math.abs(Delta.Y)
+
+                    if Y > TouchSlop and Y >= X then
+                        return
+                    end
+
+                    if X > TouchSlop then
+                        Sliding = true
+                        break
+                    end
+
+                    RunService.RenderStepped:Wait()
+                end
+
+                if not Sliding then
+                    if not Slider.Destroyed and (Input.Position - Start).Magnitude <= TouchSlop then
+                        ApplyInput()
+                    end
+
+                    return
+                end
+            end
+
             if Library.ActiveTab then
                 for _, Side in Library.ActiveTab.Sides do
                     Side.ScrollingEnabled = false
@@ -8164,17 +8356,7 @@ do
             end
 
             while IsDragInput(Input) and not Slider.Destroyed do
-                local Location = Mouse.X
-                local Scale = math.clamp((Location - Bar.AbsolutePosition.X) / Bar.AbsoluteSize.X, 0, 1)
-
-                local OldValue = Slider.Value
-                Slider.Value = Round(Slider.Min + ((Slider.Max - Slider.Min) * Scale), Slider.Rounding)
-
-                Slider:Display()
-                if Slider.Value ~= OldValue then
-                    Slider:RunChanged()
-                end
-
+                ApplyInput()
                 RunService.RenderStepped:Wait()
             end
 
@@ -8469,7 +8651,7 @@ do
         )
         Dropdown.Menu = MenuTable
 
-        local ItemHeight = 21
+        local ItemHeight = Library.IsMobile and 28 or 21
         local PoolSize = math.max(1, Info.MaxVisibleDropdownItems + 2)
         local Pool = {}
         local FilteredEntries = {}
@@ -8889,7 +9071,7 @@ do
                 end
             end
 
-            table.insert(Dropdown.Connections, Button.MouseButton1Click:Connect(function()
+            table.insert(Dropdown.Connections, OnTap(Button, function()
                 local Entry = Row.Entry
                 if not Entry or Entry.IsDisabled or DragSelecting then
                     return
@@ -9249,8 +9431,8 @@ do
             MenuTable:Toggle()
         end
 
-        table.insert(Dropdown.Connections, DisplayContainer.MouseButton1Click:Connect(ToggleDropdown))
-        table.insert(Dropdown.Connections, DisplayButton.MouseButton1Click:Connect(ToggleDropdown))
+        table.insert(Dropdown.Connections, OnTap(DisplayContainer, ToggleDropdown))
+        table.insert(Dropdown.Connections, OnTap(DisplayButton, ToggleDropdown))
 
         if SearchBox then
             table.insert(Dropdown.Connections, SearchBox:GetPropertyChangedSignal("Text"):Connect(Dropdown.BuildDropdownList))
@@ -10552,7 +10734,7 @@ function Library:Notify(...)
                 ImageTransparency = 0.5,
             }):Play()
         end)
-        CloseButton.MouseButton1Click:Connect(function()
+        OnTap(CloseButton, function()
             Data:Destroy("user")
         end)
     end
@@ -12412,7 +12594,7 @@ function Library:CreateWindow(WindowInfo)
                     Tab:Show()
                 end
 
-                Button.MouseButton1Click:Connect(Tab.Show)
+                OnTap(Button, Tab.Show)
 
                 Tab.AddTabbox = AddTabbox
                 setmetatable(Tab, BaseGroupbox)
@@ -12873,7 +13055,7 @@ function Library:CreateWindow(WindowInfo)
             end
 
             if Info.DisableCollapsing ~= true then
-                GroupboxCollapseArrow.MouseButton1Click:Connect(function()
+                OnTap(GroupboxCollapseArrow, function()
                     Groupbox:ToggleCollapsed()
                 end)
             end
@@ -13081,7 +13263,7 @@ function Library:CreateWindow(WindowInfo)
         TabButton.MouseLeave:Connect(function()
             Tab:Hover(false)
         end)
-        TabButton.MouseButton1Click:Connect(Tab.Show)
+        OnTap(TabButton, Tab.Show)
 
         Library.Tabs[Name] = Tab
 
@@ -13317,15 +13499,7 @@ function Library:CreateWindow(WindowInfo)
                 }):Play()
             end)
 
-            Button.InputBegan:Connect(function(Input)
-                if not IsClickInput(Input) then
-                    return
-                end
-
-                if not Library:MouseIsOverFrame(Button, Input.Position) then
-                    return
-                end
-
+            OnTap(Button, function()
                 Callback(Box.Text)
             end)
         end
@@ -13481,7 +13655,7 @@ function Library:CreateWindow(WindowInfo)
         TabButton.MouseLeave:Connect(function()
             Tab:Hover(false)
         end)
-        TabButton.MouseButton1Click:Connect(Tab.Show)
+        OnTap(TabButton, Tab.Show)
 
         Tab.Container = TabContainer
         setmetatable(Tab, BaseGroupbox)
@@ -13772,7 +13946,7 @@ function Library:CreateWindow(WindowInfo)
             Library.Dialogues[Idx] = nil
         end
 
-        DialogOverlay.MouseButton1Click:Connect(function()
+        OnTap(DialogOverlay, function()
             if Info.OutsideClickDismiss then
                 Dialog:Dismiss()
             end
@@ -13926,7 +14100,7 @@ function Library:CreateWindow(WindowInfo)
                 }):Play()
             end)
 
-            TextBtn.MouseButton1Click:Connect(function()
+            OnTap(TextBtn, function()
                 if not IsActive then return end
                 if ButtonInfo.Callback then
                     ButtonInfo.Callback(Dialog)
@@ -14099,12 +14273,13 @@ function Library:CreateWindow(WindowInfo)
         local StartPos, StartWidth
         local Dragging = false
         local Changed
+        local GrabInput
 
         local SidebarGrabber = New("TextButton", {
             AnchorPoint = Vector2.new(0.5, 0),
             BackgroundTransparency = 1,
             Position = UDim2.fromScale(0.5, 0),
-            Size = UDim2.new(0, 8, 1, 0),
+            Size = UDim2.new(0, Library.IsMobile and 16 or 8, 1, 0),
             Text = "",
             Parent = DividerLine,
         })
@@ -14129,12 +14304,17 @@ function Library:CreateWindow(WindowInfo)
 
             Library.CantDragForced = true
 
+            if Changed and Changed.Connected then
+                Changed:Disconnect()
+            end
+
             StartPos = Input.Position
             StartWidth = Window:GetSidebarWidth()
             Dragging = true
+            GrabInput = Input
 
             Changed = Input.Changed:Connect(function()
-                if Input.UserInputState ~= Enum.UserInputState.End then
+                if not IsInputEnded(Input) then
                     return
                 end
 
@@ -14162,7 +14342,7 @@ function Library:CreateWindow(WindowInfo)
                 return
             end
 
-            if Dragging and IsHoverInput(Input) then
+            if Dragging and IsDragMove(Input, GrabInput) then
                 local Delta = Input.Position - StartPos
                 local Width = StartWidth + Delta.X
 
@@ -14923,7 +15103,7 @@ function Library:CreateLoading(LoadingInfo)
                 }):Play()
             end)
 
-            TextBtn.MouseButton1Click:Connect(function()
+            OnTap(TextBtn, function()
                 if ButtonInfo.Callback then
                     ButtonInfo.Callback(Loading)
                 end
